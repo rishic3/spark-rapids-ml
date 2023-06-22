@@ -38,6 +38,7 @@ import numpy as np
 import pandas as pd
 from pyspark import RDD, TaskContext
 from pyspark.ml import Estimator, Model
+from pyspark.ml.evaluation import Evaluator
 from pyspark.ml.functions import array_to_vector, vector_to_array
 from pyspark.ml.linalg import VectorUDT
 from pyspark.ml.param.shared import (
@@ -94,8 +95,8 @@ FitInputType = Union[List[_SinglePdDataFrameBatchType], List[_SingleNpArrayBatch
 # TransformInput type
 TransformInputType = Union["cudf.DataFrame", np.ndarray]
 
-# Function to construct cuml instance on the executor side
-_ConstructFunc = Callable[..., CumlT]
+# Function to construct cuml instances on the executor side
+_ConstructFunc = Callable[..., Union[CumlT, List[CumlT]]]
 
 # Function to do the inference using cuml instance constructed by _ConstructFunc
 _TransformFunc = Callable[[CumlT, TransformInputType], pd.DataFrame]
@@ -114,8 +115,8 @@ Alias = namedtuple("Alias", ("data", "label", "row_number"))
 alias = Alias("cuml_values", "cuml_label", "unique_id")
 
 # Global prediction names
-Pred = namedtuple("Pred", ("prediction", "probability"))
-pred = Pred("prediction", "probability")
+Pred = namedtuple("Pred", ("prediction", "probability", "model_index"))
+pred = Pred("prediction", "probability", "model_index")
 
 # Global parameter alias used by core and subclasses.
 ParamAlias = namedtuple(
@@ -432,6 +433,13 @@ class _CumlCaller(_CumlParams, _CumlCommon):
 
         is_local = _is_local(_get_spark_session().sparkContext)
 
+        cuda_managed_mem_enabled = (
+            _get_spark_session().conf.get("spark.rapids.ml.uvm.enabled", "false")
+            == "true"
+        )
+        if cuda_managed_mem_enabled:
+            get_logger(cls).info("CUDA managed memory enabled.")
+
         # parameters passed to subclass
         params: Dict[str, Any] = {
             param_alias.cuml_init: self.cuml_params,
@@ -466,6 +474,15 @@ class _CumlCaller(_CumlParams, _CumlCommon):
             logger = get_logger(cls)
             logger.info("Initializing cuml context")
 
+            import cupy as cp
+
+            if cuda_managed_mem_enabled:
+                import rmm
+                from rmm.allocators.cupy import rmm_cupy_allocator
+
+                rmm.reinitialize(managed_memory=True)
+                cp.cuda.set_allocator(rmm_cupy_allocator)
+
             _CumlCommon.initialize_cuml_logging(cuml_verbose)
 
             context = BarrierTaskContext.get()
@@ -485,9 +502,14 @@ class _CumlCaller(_CumlParams, _CumlCommon):
                 for pdf in pdf_iter:
                     sizes.append(pdf.shape[0])
                     if multi_col_names:
-                        features = pdf[multi_col_names]
+                        features = np.array(pdf[multi_col_names], order=array_order)
                     else:
                         features = np.array(list(pdf[alias.data]), order=array_order)
+                    # experiments indicate it is faster to convert to numpy array and then to cupy array than directly
+                    # invoking cupy array on the list
+                    if cuda_managed_mem_enabled:
+                        features = cp.array(features)
+
                     label = pdf[alias.label] if alias.label in pdf.columns else None
                     row_number = (
                         pdf[alias.row_number]
@@ -677,6 +699,13 @@ class _CumlEstimator(Estimator, _CumlCaller):
     @classmethod
     def read(cls) -> MLReader:
         return _CumlEstimatorReader(cls)
+
+    def _supportsTransformEvaluate(self, evaluator: Evaluator) -> bool:
+        """If supporting _transformEvaluate in a single pass based on the evaluator
+
+        Please note that this function should only be used in CrossValidator for quick
+        fallback if unsupported."""
+        return False
 
 
 class _CumlEstimatorSupervised(_CumlEstimator, HasLabelCol):
@@ -872,19 +901,25 @@ class _CumlModel(Model, _CumlParams, _CumlCommon):
             _CumlCommon.set_gpu_device(context, is_local, True)
 
             # Construct the cuml counterpart object
-            cuml_object = construct_cuml_object_func()
+            cuml_instance = construct_cuml_object_func()
+            cuml_objects = (
+                cuml_instance if isinstance(cuml_instance, list) else [cuml_instance]
+            )
 
+            # TODO try to concatenate all the data and do the transform.
             for pdf in pdf_iter:
-                # Transform the dataset
-                if input_is_multi_cols:
-                    data = cuml_transform_func(cuml_object, pdf[select_cols])
-                else:
-                    nparray = np.array(list(pdf[select_cols[0]]), order=array_order)
-                    data = cuml_transform_func(cuml_object, nparray)
-                # Evaluate the dataset if necessary.
-                if evaluate_func is not None:
-                    data = evaluate_func(pdf, data)
-                yield data
+                for index, cuml_object in enumerate(cuml_objects):
+                    # Transform the dataset
+                    if input_is_multi_cols:
+                        data = cuml_transform_func(cuml_object, pdf[select_cols])
+                    else:
+                        nparray = np.array(list(pdf[select_cols[0]]), order=array_order)
+                        data = cuml_transform_func(cuml_object, nparray)
+                    # Evaluate the dataset if necessary.
+                    if evaluate_func is not None:
+                        data = evaluate_func(pdf, data)
+                        data[pred.model_index] = index
+                    yield data
 
         return dataset.mapInPandas(_transform_udf, schema=schema)  # type: ignore
 
@@ -912,6 +947,36 @@ class _CumlModel(Model, _CumlParams, _CumlCommon):
     @classmethod
     def read(cls) -> MLReader:
         return _CumlModelReader(cls)
+
+    def _transformEvaluate(
+        self,
+        dataset: DataFrame,
+        evaluator: Evaluator,
+        params: Optional["ParamMap"] = None,
+    ) -> List[float]:
+        """
+        Transforms and evaluates the input dataset with optional parameters in a single pass.
+
+        Parameters
+        ----------
+        dataset : :py:class:`pyspark.sql.DataFrame`
+            a dataset that contains labels/observations and predictions
+        evaluator: :py:class:`pyspark.ml.evaluation.Evaluator`
+            an evaluator user intends to use
+        params : dict, optional
+            an optional param map that overrides embedded params
+
+        Returns
+        -------
+        float
+            metric
+        """
+        raise NotImplementedError()
+
+    @staticmethod
+    def _combine(models: List["_CumlModel"]) -> "_CumlModel":
+        """Combine a list of same type models into a model"""
+        raise NotImplementedError()
 
 
 class _CumlModelWithColumns(_CumlModel):
@@ -962,12 +1027,16 @@ class _CumlModelWithColumns(_CumlModel):
 
             context = TaskContext.get()
             _CumlCommon.set_gpu_device(context, is_local, True)
-            cuml_object = construct_cuml_object_func()
+            cuml_objects = construct_cuml_object_func()
+            cuml_object = (
+                cuml_objects[0] if isinstance(cuml_objects, list) else cuml_objects
+            )
             for pdf in iterator:
                 if not input_is_multi_cols:
                     data = np.array(list(pdf[select_cols[0]]), order=array_order)
                 else:
                     data = pdf[select_cols]
+                # for normal transform, we don't allow multiple models.
                 res = cuml_transform_func(cuml_object, data)
                 del data
                 yield res
