@@ -520,10 +520,11 @@ def test_umap_chunking(
 
         umap_model = umap.fit(df)
         umap_model.BROADCAST_LIMIT = BROADCAST_LIMIT
-
+        print("Back from fit. asserting model")
         _assert_umap_model(umap_model, input_raw_data)
-
+        print("transforming...")
         pdf = umap_model.transform(df).toPandas()
+        print("Back from transform. running trustworthiness...")
         embedding = np.vstack(pdf["embedding"]).astype(np.float32)
         input = np.vstack(pdf["features"]).astype(np.float32)
 
@@ -773,3 +774,121 @@ def test_umap_precomputed_knn(
         trust_diff = loc_umap - dist_umap
 
         assert trust_diff <= 0.07
+
+@pytest.mark.parametrize("data_type", [cp.float32])
+@pytest.mark.parametrize("n_rows, n_cols, n_center", [(20000, 50, 5)])
+# @pytest.mark.parametrize("knn_graph_format", ["sparse", "dense", "tuple"])
+@pytest.mark.parametrize("knn_graph_format", ["dense_cuml", "dense_sklearn"])
+@pytest.mark.parametrize("sample_fraction", [0.4, 0.6, 0.8])
+@pytest.mark.parametrize("learning_rate", [0.7])
+@pytest.mark.parametrize("init", ["random"])
+@pytest.mark.parametrize("min_dist", [0.25])
+@pytest.mark.parametrize("set_op_mix_ratio", [0.0])
+@pytest.mark.parametrize("build_algo", ["auto"])
+@pytest.mark.parametrize("build_kwds", [{'nnd_n_clusters': 2}])
+def test_umap_precomputed_knn(
+    gpu_number,
+    data_type,
+    n_rows, n_cols, n_center,
+    knn_graph_format,
+    sample_fraction,
+    learning_rate,
+    init,
+    min_dist,
+    set_op_mix_ratio,
+    build_algo,
+    build_kwds,
+    ):
+    from cuml.datasets import make_blobs
+    from scipy.sparse import csr_matrix, spmatrix
+    
+    random_state = 10
+    k = 15
+    knn_metric = "sqeuclidean"
+    is_float32 = True if data_type==cp.float32 else False
+    
+    print("GPU Number: ", gpu_number)
+
+    X, _ = make_blobs(
+        n_rows,
+        n_cols,
+        centers=n_center,
+        cluster_std=0.1,
+        dtype=data_type,
+        random_state=random_state,
+    )
+
+    print("Cuda Runtime device count: ", cp.cuda.runtime.getDeviceCount())
+    print("Cuda device: ", cp.cuda.runtime.getDevice())
+
+    if knn_graph_format == "tuple":
+        from cuvs.neighbors import cagra
+
+        # cagra doesn't support float64 yet
+        X_row_major = cp.ascontiguousarray(X)
+        build_params = cagra.IndexParams(metric=knn_metric)
+        index = cagra.build(build_params, X_row_major)
+        distances, neighbors = cagra.search(cagra.SearchParams(), index, X_row_major, k)
+        distances = cp.asarray(distances)
+        neighbors = cp.asarray(neighbors)
+        precomputed_knn = (neighbors.get(), distances.get())
+        assert isinstance(precomputed_knn[0], np.ndarray) and isinstance(
+            precomputed_knn[1], np.ndarray
+        )
+    elif knn_graph_format == "sparse":
+        from cuml.neighbors import NearestNeighbors
+
+        knn_model = NearestNeighbors(n_neighbors=k, metric=knn_metric)
+        knn_model.fit(X)
+        precomputed_knn = knn_model.kneighbors_graph(X).get()
+        assert isinstance(precomputed_knn, spmatrix)
+    elif knn_graph_format == "dense_cuml":
+        from cuml.metrics import pairwise_distances
+
+        precomputed_knn = pairwise_distances(X, metric=knn_metric).get()
+        assert isinstance(precomputed_knn, np.ndarray)
+    elif knn_graph_format == "dense_sklearn":
+        from sklearn.metrics import pairwise_distances
+
+        precomputed_knn = pairwise_distances(X.get(), metric=knn_metric)
+        assert isinstance(precomputed_knn, np.ndarray)
+    else:
+        assert 1==0, "Invalid KNN Graph Format"
+    
+    with CleanSparkSession() as spark:
+        pyspark_type = "float"
+        feature_cols = [f"c{i}" for i in range(X.shape[1])]
+        schema = [f"{c} {pyspark_type}" for c in feature_cols]
+        df = spark.createDataFrame(X.tolist(), ",".join(schema))
+        df = df.withColumn("features", array(*feature_cols)).drop(*feature_cols)
+
+        umap = UMAP(
+            num_workers=gpu_number,
+            metric=knn_metric,
+            random_state=random_state,
+            float32_inputs=is_float32,
+            sample_fraction=sample_fraction,
+            learning_rate=learning_rate,
+            init=init,
+            min_dist=min_dist,
+            set_op_mix_ratio=set_op_mix_ratio,
+            build_algo=build_algo,
+            build_kwds=build_kwds,
+            precomputed_knn=precomputed_knn,
+        ).setFeaturesCol("features")
+
+        model_precomputed_knn = umap.cuml_params.get("precomputed_knn")
+        assert model_precomputed_knn is not None
+
+        umap_model = umap.fit(df)
+        assert umap_model.cuml_params.get("precomputed_knn") is None, \
+            "Precomputed knn should be deleted after model fitting."
+        assert umap_model.dtype == "float32", \
+            "Data type should be float32 after convertion."
+
+        pdf = umap_model.transform(df).toPandas()
+        embedding = cp.asarray(pdf["embedding"].to_list())
+        input = cp.asarray(pdf["features"].to_list())
+        assert embedding.shape == (input.shape[0], umap_model.cuml_params["n_components"]), \
+            "Embedding and Input data shape should be the same."
+
