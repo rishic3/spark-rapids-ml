@@ -51,7 +51,6 @@
             "spark.executor.cores":"8",
             "spark.task.cpus":"1",
             "spark.task.resource.gpu.amount":"1",
-            "spark.rapids.memory.pinnedPool.size":"2G",
             "spark.executor.memoryOverhead":"2G",
             "spark.sql.files.maxPartitionBytes":"256m",
             "spark.sql.adaptive.enabled":"false",

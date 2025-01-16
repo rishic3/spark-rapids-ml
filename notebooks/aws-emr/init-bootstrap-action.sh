@@ -35,8 +35,8 @@ sudo /usr/local/bin/pip3.10 install --upgrade pip
 sudo /usr/local/bin/pip3.10 install scikit-learn
 
 # install cudf and cuml
-sudo /usr/local/bin/pip3.10 install --no-cache-dir cudf-cu12 --extra-index-url=https://pypi.nvidia.com --verbose
-sudo /usr/local/bin/pip3.10 install --no-cache-dir cuml-cu12 cuvs-cu12 --extra-index-url=https://pypi.nvidia.com --verbose
+sudo /usr/local/bin/pip3.10 install --no-cache-dir cudf-cu12~=${RAPIDS_VERSION} --extra-index-url=https://pypi.nvidia.com --verbose
+sudo /usr/local/bin/pip3.10 install --no-cache-dir cuml-cu12~=${RAPIDS_VERSION} cuvs-cu12~=${RAPIDS_VERSION} --extra-index-url=https://pypi.nvidia.com --verbose
 
 sudo /usr/local/bin/pip3.10 list
 
