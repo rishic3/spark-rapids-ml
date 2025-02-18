@@ -69,8 +69,6 @@ If you already have a Dataproc account, you can run the example notebooks on a D
   
   Open the notebook and select the `PySpark` kernel using, e.g., the drop down that appears after clicking on the kernel name appearing in the top right corner of the notebook view.
 
-<<<<<<< Updated upstream
-=======
   spark = SparkSession.builder \
   .appName("spark-rapids-ml") \
   .config("spark.executor.resource.gpu.amount", "1") \
@@ -84,5 +82,4 @@ If you already have a Dataproc account, you can run the example notebooks on a D
   .getOrCreate()
   ```
   **Note**: these settings are for demonstration purposes only.  Additional tuning may be required for optimal performance.
->>>>>>> Stashed changes
 - Run the notebook cells.  **Note**: you may need to change file paths to use `hdfs://` paths.
